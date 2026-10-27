@@ -1,0 +1,441 @@
+---
+title: "Matrix Completion vs Difference-in-Differences on the Callaway--Sant'Anna Minimum-Wage Data"
+subtitle: "Sensitivity analysis"
+author: "Marco Ventura, Angela Zanoni"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: readable
+    df_print: paged
+    code_folding: show
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 8,
+  fig.height = 6,
+  dpi = 300
+)
+```
+
+## Overview
+
+This document runs three sensitivity exercises for a Matrix Completion Panel (MCP) estimator:
+
+- **Loop A:** Shrink the donor pool ($N$) while keeping $T$ fixed. Examines how in-sample RMSE changes as the number of available control units decreases.
+- **Loop B:** Shrink $T$ while keeping $N$ fixed. Examines how MCP performs with a shorter time dimension. The panel is truncated from the right, so later years are removed first. Iterations with no treated cells are skipped.
+- **Loop C:** Per-cohort pre-treatment window sensitivity. For each treatment cohort $C$, restricts usable pre-treatment information to $k_\text{pre}$ periods and refits MCP. The resulting cohort-specific ATT is compared across different values of $k_\text{pre}$.
+
+**Input:** `data/df_covs_linear.csv`  
+**Outputs:** `output/sim_shrink_N.csv`, `output/sim_shrink_T.csv`, `output/sim_cohort_prewindow.csv`
+
+---
+
+## Setup
+
+### Packages
+
+```{r packages}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(ggplot2)
+  library(MCPanel)
+})
+```
+
+### Parameters
+
+```{r parameters}
+NUM_RUNS      <- 10L
+SEED_MCP      <- 1234L
+TOL_L         <- 1e-8
+N_GRID_LENGTH <- 15L  # Number of grid points for Loop A
+```
+
+> `N_GRID_LENGTH` controls how many distinct $N$ values are tested in Loop A. Testing every possible $N$ would be computationally expensive, so a grid is used instead.
+
+---
+
+## Data
+
+```{r load-data}
+mpdta <- read_csv(
+  "data/df_covs_linear.csv",
+  show_col_types = FALSE
+)
+```
+
+---
+
+## Build Panel Matrices
+
+Units are ordered by treatment timing (later-treated units first; never-treated/control units at the bottom). The treatment indicator `t` equals 1 only for post-treatment periods of treated units.
+
+```{r build-panel-matrices}
+build_panel_matrices <- function(df) {
+
+  df <- df |>
+    mutate(
+      t_group = as.integer(year >= firsttreat),
+      t       = treat * t_group
+    )
+
+  # Units ordered by treatment timing; controls (firsttreat = 0) go last
+  unit_order <- df |>
+    distinct(countyreal, firsttreat) |>
+    arrange(desc(firsttreat), countyreal) |>
+    pull(countyreal)
+
+  to_wide <- function(var) {
+    df |>
+      select(countyreal, year, all_of(var)) |>
+      pivot_wider(
+        names_from  = year,
+        values_from = all_of(var),
+        values_fn   = ~ mean(.x, na.rm = TRUE)
+      ) |>
+      arrange(match(countyreal, unit_order)) |>
+      select(-countyreal) |>
+      mutate(across(everything(), as.numeric)) |>
+      as.matrix()
+  }
+
+  Y         <- to_wide("lemp")
+  treat_mat <- to_wide("t")
+  years     <- as.integer(colnames(Y))
+
+  first_treat <- df |>
+    distinct(countyreal, firsttreat) |>
+    arrange(match(countyreal, unit_order)) |>
+    pull(firsttreat)
+
+  list(
+    Y           = Y,
+    treat_mat   = treat_mat,
+    years       = years,
+    first_treat = first_treat,
+    unit_order  = unit_order
+  )
+}
+
+mats <- build_panel_matrices(mpdta)
+
+full <- list(
+  Y           = mats$Y,
+  treat_mat   = mats$treat_mat,
+  years       = mats$years,
+  first_treat = mats$first_treat,
+  X           = NULL,
+  Z           = NULL
+)
+
+Nn <- nrow(full$Y)
+Tt <- ncol(full$Y)
+```
+
+```{r panel-summary, echo=FALSE}
+cohort_labels <- paste(
+  sort(unique(full$first_treat[full$first_treat > 0])),
+  collapse = ", "
+)
+message(sprintf(
+  "[data] N = %d units, T = %d periods, cohorts: %s",
+  Nn, Tt, cohort_labels
+))
+```
+
+The panel contains **`r Nn` units** across **`r Tt` time periods**, with treatment cohorts in years: `r cohort_labels`.
+
+---
+
+## Helper Functions
+
+### MCP Fitting Wrapper
+
+The mask convention is:
+
+| Value | Meaning |
+|-------|---------|
+| `mask = 1` | Observed / untreated cell (used by MCP) |
+| `mask = 0` | Treated / masked cell (imputed by MCP) |
+
+RMSE is computed over observed (untreated) cells only.
+
+```{r fit-mcp}
+fit_mcp <- function(sl, num_runs = NUM_RUNS, seed = SEED_MCP) {
+
+  Y         <- sl$Y
+  treat_mat <- sl$treat_mat
+  mask      <- 1 - treat_mat   # 1 = observed, 0 = masked
+
+  N <- nrow(Y)
+  T <- ncol(Y)
+
+  rmse_v <- numeric(num_runs)
+  fit    <- NULL
+
+  set.seed(seed)
+
+  for (i in seq_len(num_runs)) {
+
+    # Treated cells set to zero; mask tells mcnnm_cv() which cells are observed
+    Y_obs <- Y * mask
+
+    fit <- mcnnm_cv(
+      Y_obs,
+      mask,
+      to_estimate_u = 1L,
+      to_estimate_v = 1L
+    )
+
+    # Reconstruct untreated potential outcomes
+    fit$Mhat <-
+      fit$L +
+      replicate(T, fit$u) +
+      t(replicate(N, fit$v))
+
+    # Reconstruction errors on observed cells only
+    fit$msk_err <- (fit$Mhat - Y) * mask
+
+    n_observed <- sum(mask)
+
+    rmse_v[i] <- if (n_observed > 0) {
+      sqrt(sum(fit$msk_err^2) / n_observed)
+    } else {
+      NA_real_
+    }
+  }
+
+  list(
+    fit       = fit,
+    rmse_mean = mean(rmse_v, na.rm = TRUE),
+    rmse_se   = sd(rmse_v, na.rm = TRUE) / sqrt(num_runs)
+  )
+}
+```
+
+### Panel Slicing
+
+Retains the first `n` units and first `t` time periods. Loop A varies `n` (with `t = Tt`); Loop B varies `t` (with `n = Nn`).
+
+```{r slice-panel}
+slice_panel <- function(full, n, t) {
+
+  stopifnot(n <= nrow(full$Y), t <= ncol(full$Y))
+
+  list(
+    Y         = full$Y[1:n, 1:t, drop = FALSE],
+    treat_mat = full$treat_mat[1:n, 1:t, drop = FALSE],
+    X = if (!is.null(full$X)) full$X[1:n, , drop = FALSE] else NULL,
+    Z = if (!is.null(full$Z)) full$Z[1:t, , drop = FALSE] else NULL
+  )
+}
+```
+
+### Helper to extract ATT
+
+```{r summarize-fit}
+# Shared table-row builder for all three loops.
+# att_mask defines which Y-cells count toward ATT (1 = counts); it is NOT
+# necessarily the same mask used to fit MCP (Loop C differs on this point).
+summarize_fit <- function(res, Y, att_mask, n, t, extra = list()) {
+  out <- data.frame(n = n, t = t, rmse = NA_real_, att = NA_real_,
+                     status = "ok", stringsAsFactors = FALSE)
+  if (length(extra) > 0) out <- cbind(out, as.data.frame(extra, stringsAsFactors = FALSE))
+
+  if (inherits(res, "try-error")) {
+    out$status <- "mcp_error"
+    return(out)
+  }
+
+  n_att <- sum(att_mask)
+  if (n_att == 0L) {
+    out$status <- "no_treated_cells"
+    return(out)
+  }
+
+  effect   <- (res$fit$Mhat - Y) * att_mask
+  out$rmse <- res$rmse_mean
+  out$att  <- sum(-effect) / n_att   # global ATT over the att_mask cells
+  out
+}
+```
+
+
+### Single-Iteration Runner (Loops A and B)
+
+```{r run-one}
+# Loops A and B: the fitting mask IS the ATT mask (no separate cohort window).
+run_one <- function(sl, n, t) {
+  n_masked <- sum(sl$treat_mat)
+  if (n_masked == 0L) {
+    return(data.frame(n = n, t = t, rmse = NA_real_, att = NA_real_,
+                       status = "no_treated_cells"))
+  }
+  res <- try(fit_mcp(sl), silent = TRUE)
+  summarize_fit(res, sl$Y, att_mask = sl$treat_mat, n = n, t = t)
+}
+```
+
+## Loop A: Shrink $N$
+
+All treated units are always retained. The number of control units is reduced according to the grid. RMSE is expected to rise as the donor pool shrinks.
+
+```{r loop-a}
+treated_rows <- which(full$first_treat > 0)
+control_rows <- which(full$first_treat == 0)
+
+N_treated  <- length(treated_rows)
+N_controls <- length(control_rows)
+
+message(sprintf(
+  "[loop A] treated units = %d, control units = %d",
+  N_treated, N_controls
+))
+
+# Grid of total N values; minimum is N_treated (no controls removed beyond that)
+N_grid <- unique(round(seq(
+  from       = Nn,
+  to         = N_treated,
+  length.out = N_GRID_LENGTH
+)))
+
+message(sprintf(
+  "[loop A] N grid (%d points): %s",
+  length(N_grid),
+  paste(N_grid, collapse = ", ")
+))
+
+res_N <- bind_rows(lapply(N_grid, function(n) {
+
+  n_controls_keep <- n - N_treated
+  rows_keep       <- c(treated_rows, control_rows[seq_len(n_controls_keep)])
+
+  message(sprintf(
+    "  N = %d (%d treated + %d controls) ...",
+    n, N_treated, n_controls_keep
+  ))
+
+  sl <- list(
+    Y         = full$Y[rows_keep, , drop = FALSE],
+    treat_mat = full$treat_mat[rows_keep, , drop = FALSE],
+    X = if (!is.null(full$X)) full$X[rows_keep, , drop = FALSE] else NULL,
+    Z = full$Z
+  )
+
+  run_one(sl, n, Tt)
+}))
+```
+
+```{r loop-a-summary}
+res_N
+```
+
+---
+
+## Loop B: Shrink $T$
+
+The panel is truncated from the right (later years removed first). Iterations where the truncated panel contains no treated cells are skipped automatically.
+
+```{r loop-b}
+message("[loop B] shrinking T from Tt down to 2 ...")
+
+res_T <- bind_rows(lapply(Tt:2, function(t) {
+  message(sprintf("  T = %d ...", t))
+  sl <- slice_panel(full, n = Nn, t = t)
+  run_one(sl, Nn, t)
+}))
+```
+
+```{r loop-b-summary}
+res_T
+```
+
+---
+
+## Loop C: Per-Cohort Pre-Treatment Window Sensitivity
+
+For each treatment cohort $C$ and each $k_\text{pre} \in \{1, \dots, \text{max\_pre}\}$:
+
+1. Restrict MCP to only the last $k_\text{pre}$ pre-treatment periods for that cohort (earlier periods are masked).
+2. Refit MCP on the modified panel.
+3. Compute the cohort ATT using the **original** treated cells (not the modified mask).
+
+```{r per-cohort-one}
+per_cohort_one <- function(cohort, k_pre) {
+
+  Y         <- full$Y
+  treat_mat <- full$treat_mat   # will be modified for fitting only
+  years     <- full$years
+  ft        <- full$first_treat
+
+  cohort_rows <- which(ft == cohort)
+  cutoff_year <- cohort - k_pre
+  drop_cols   <- which(years < cutoff_year)
+
+  if (length(drop_cols) > 0) {
+    treat_mat[cohort_rows, drop_cols] <- 1L   # exclude these from fitting
+  }
+
+  sl  <- list(Y = Y, treat_mat = treat_mat)
+  res <- try(fit_mcp(sl), silent = TRUE)
+
+  # ATT uses the ORIGINAL treated cells for this cohort, not the modified mask
+  post_cols <- which(years >= cohort)
+  att_mask  <- matrix(0, nrow(Y), ncol(Y))
+  att_mask[cohort_rows, post_cols] <- 1
+
+  summarize_fit(res, Y, att_mask = att_mask,
+                n = length(cohort_rows), t = length(post_cols),
+                extra = list(cohort = cohort, k_pre = k_pre))
+}
+```
+
+
+```{r loop-c}
+cohorts <- sort(unique(full$first_treat[full$first_treat > 0]))
+
+message("[loop C] per-cohort pre-window sensitivity ...")
+
+res_cohort <- bind_rows(lapply(cohorts, function(cohort) {
+
+  max_pre <- sum(full$years < cohort)
+  if (max_pre < 1L) return(NULL)
+
+  bind_rows(lapply(seq_len(max_pre), function(k_pre) {
+    message(sprintf("  cohort %d, k_pre = %d ...", cohort, k_pre))
+    per_cohort_one(cohort, k_pre)
+  }))
+}))
+```
+
+```{r loop-c-summary}
+res_cohort
+```
+
+---
+
+## Save Results
+
+```{r save-results}
+dir.create("output", showWarnings = FALSE)
+
+write_csv(res_N,      "output/sim_shrink_N.csv")
+write_csv(res_T,      "output/sim_shrink_T.csv")
+write_csv(res_cohort, "output/sim_cohort_prewindow.csv")
+
+message("Results written to output/: sim_shrink_N.csv, sim_shrink_T.csv, sim_cohort_prewindow.csv")
+```

@@ -1,0 +1,805 @@
+---
+title: "Matrix Completion vs Difference-in-Differences on the Callaway--Sant'Anna
+  Minimum-Wage Data"
+author: "Marco Ventura, Angela Zanoni"
+subtitle: "Replication package --- state-cluster bootstrap inference"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: readable
+    df_print: paged
+    code_folding: show
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  cache   = TRUE,     # the bootstrap takes hours: re-knitting reuses unchanged chunks
+  autodep = TRUE,     # ...and re-runs a cached chunk when an object it uses has changed
+  fig.width  = 8,
+  fig.height = 6,
+  dpi = 300
+)
+```
+
+# Overview
+
+Replication package for *"Understanding Matrix Completion for Causal Panel Data. A Practitioner's Guide with an Application to the Employment Effects of Minimum Wage"*.
+
+MCP estimates use the [MCPanel](https://github.com/susanathey/MCPanel) package. The document follows the order of the paper:
+
+1.  **Low-rank diagnostic** --- scree plot of the singular values of the masked outcome matrix $Y_\text{obs}$ (Figure 1; Section 3.2 of the paper).
+2.  **Unconditional case** --- MCP without covariates (`MCPanel::mcnnm_cv`) compared against the Callaway--Sant'Anna staggered DiD, for both control groups: not-yet-treated (benchmark, Table A.4) and never-treated (Table A.5); group-time plots as in Figures A.2 and A.4.
+3.  **Conditional case** --- MCP with covariates (`MCPanel::mcnnm_wc_cv`) against the covariate-adjusted CS estimator, again for both control groups (Tables 2 and A.3; Figures A.1 and A.3).
+4.  **Implementation details** --- software versions, the $\lambda$ grids and cross-validation design, selected regularization parameters, bootstrap settings, and the effective rank of $\hat L$.
+5.  **Parallel-trends falsification** --- the specification tests of Section 4 (Tables 3 and A.6).
+
+**Inference for MCP.** Standard errors and 95% confidence intervals for MCP come from a **state-cluster bootstrap**: treated counties are kept fixed, never-treated states are resampled with replacement, and MCP is refitted at the full-sample $\lambda$. This replaces the non-clustered descriptive standard errors $sd_{g,t}/\sqrt{n_{g,t}}$ of Appendix A.2. Point estimates are those of the full-sample fit.
+
+The sensitivity analyses of Appendix A.7 (Tables A.7--A.9) are implemented in the companion document `sensitivity.Rmd` distributed with this package.
+
+## Required inputs
+
+Place in the `data/` folder next to this document:
+
+- `data/df_covs_linear.csv` --- CS minimum-wage panel with linearly-interpolated time-varying covariates (US Census intercensal datasets and SAIPE; see Appendix A.3 of the paper), and a `state_name` column used as the bootstrap cluster.
+
+## Required packages
+
+`MCPanel`, `did`, `dplyr`, `tidyr`, `readr`, `ggplot2`, `knitr`. `MCPanel` is not on CRAN:
+
+``` r
+# install.packages("devtools")
+devtools::install_github("susanathey/MCPanel@6b2706fd7c35f3266048ceb22a7e9a61ae1774da")   # commit used for the paper
+```
+
+```{r packages, cache=FALSE}
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(readr); library(ggplot2)
+  library(MCPanel)  # matrix completion
+  library(did)      # Callaway-Sant'Anna
+  library(knitr)
+})
+
+SEED    <- 2024
+B       <- 200     # bootstrap replications
+ALPHA   <- 0.05    # 95% percentile intervals
+N_CORES <- max(1L, min(3L, parallel::detectCores() - 1L))   # MCP-C needs ~8-10 GB RAM per core
+set.seed(SEED)
+```
+
+# Data
+
+```{r load-panel}
+# Load data
+cov_vars <- c("pop_covs", "white_covs", "pov_covs", "medinc_covs")
+
+df <- readr::read_csv("data/df_covs_linear.csv", show_col_types = FALSE)
+
+# Sort counties in descending order by first treatment year: treated block on top, never-treated last
+unit_order <- df |>
+  distinct(countyreal, firsttreat) |>
+  arrange(desc(firsttreat), countyreal) |>
+  pull(countyreal)
+
+```
+
+## Comparison of covariates (pre-treatment year)
+
+Sanity check replicating Table A.2 of the paper: our reconstructed county covariates in the last pre-treatment year against those distributed with the original CS dataset.
+
+```{r pre-treat-check}
+
+# Filter data to pre-treatment year for the treated
+pre <- df |>
+  filter(year == firsttreat - 1, treat == 1) |>
+  drop_na(all_of(cov_vars))
+
+# Build table
+comparison <- tibble::tibble(
+  variable    = c("log(pop)", "white share", "median income (1000s)", "poverty rate"),
+  `CS`        = c(mean(pre$pop,    na.rm = TRUE),
+                  mean(pre$white,  na.rm = TRUE),
+                  mean(pre$medinc, na.rm = TRUE),
+                  mean(pre$pov,    na.rm = TRUE)),
+  `Our Panel` = c(mean(pre$pop_covs,    na.rm = TRUE),
+                  mean(pre$white_covs,  na.rm = TRUE),
+                  mean(pre$medinc_covs, na.rm = TRUE),
+                  mean(pre$pov_covs,    na.rm = TRUE))
+)
+knitr::kable(comparison, digits = 3,
+             caption = "Mean of covariates, comparison with the original CS dataset (paper Table A.2)")
+```
+
+## From long panel to MCPanel matrices
+
+`MCPanel` requires $N \times T$ matrices: the outcome $Y$ and a mask, equal to 1 where the entry is observed (untreated) and 0 where the counterfactual must be imputed (treated unit--time pairs), i.e. `mask = 1 - treat_mat`. Units are ordered by descending treatment cohort so that treated units occupy the first rows, as in the original scripts.
+
+When covariates are requested, the function also returns the $N \times P$ matrix $X$ of unit-specific covariate means and the $T \times Q$ matrix $Z$ of time-specific covariate means, which is how `mcnnm_wc` accommodates the $XHZ'$ structure (see Section 2.1 of the paper).
+
+The function also keeps the state of each county, which is the cluster resampled by the bootstrap.
+
+```{r build-matrices}
+
+build_panel_matrices <- function(df, cov_names = NULL) {
+
+  df <- df |>
+    mutate(
+      t_group = as.integer(year >= firsttreat),
+      t       = treat * t_group
+    )
+
+  # Restrict the global unit_order to units actually present in this df
+  local_unit_order <- unit_order[unit_order %in% unique(df$countyreal)]
+
+  to_wide <- function(varname) {
+    df |>
+      select(countyreal, year, all_of(varname)) |>
+      pivot_wider(names_from  = year,
+                  values_from = all_of(varname),
+                  values_fn   = ~ mean(.x, na.rm = TRUE)) |>
+      arrange(match(countyreal, local_unit_order)) |>
+      select(-countyreal) |>
+      mutate(across(everything(), as.numeric)) |>
+      as.matrix()
+  }
+
+  Y     <- to_wide("lemp")
+  treat <- to_wide("t")
+  mask  <- 1 - treat
+
+  first_treat <- df |>
+    distinct(countyreal, firsttreat) |>
+    arrange(match(countyreal, local_unit_order)) |>
+    pull(firsttreat)
+
+  # State of each row: cluster for the bootstrap
+  state <- df |>
+    distinct(countyreal, state_name) |>
+    arrange(match(countyreal, local_unit_order)) |>
+    pull(state_name)
+
+  out <- list(Y = Y, mask = mask, treat_mat = treat,
+              unit_order  = local_unit_order,
+              first_treat = first_treat,
+              state       = state,
+              years       = as.integer(colnames(Y)))
+
+  if (!is.null(cov_names)) {
+    out$X <- df |>
+      group_by(countyreal) |>
+      summarise(across(all_of(cov_names), \(x) mean(x, na.rm = TRUE)),
+                .groups = "drop") |>
+      arrange(match(countyreal, local_unit_order)) |>
+      select(-countyreal) |>
+      as.matrix()
+
+    out$Z <- df |>
+      group_by(year) |>
+      summarise(across(all_of(cov_names), \(x) mean(x, na.rm = TRUE)),
+                .groups = "drop") |>
+      arrange(year) |>
+      select(-year) |>
+      as.matrix()
+  }
+
+  out
+}
+
+mats <- build_panel_matrices(df)
+```
+
+# Diagnostic: scree plot on the masked outcome matrix
+
+Following Section 3.2 of the paper, we assess the plausibility of the low-rank assumption on $Y_\text{obs}$, the outcome matrix with post-treatment cells of treated units masked, so that the SVD is not contaminated by treatment effects.
+
+```{r scree, fig.height=5, fig.cap="Scree plot of the singular values of $Y_\\text{obs}$ (paper Figure 1)."}
+
+Y_obs <- mats$Y * mats$mask     # mask (set to 0) post-treatment cells of treated units
+
+sv <- svd(Y_obs)
+s <- sv$d     # get singular values
+
+plot(s, type = "b", main = "Scree Plot",
+     ylab = "Singular Values", xlab = "Factor Number")
+
+
+# Variance share of a singular value: sigma_k^2 / sum(sigma^2)
+share_first <- s[1]^2 / sum(s^2)
+sprintf("Variance share of the first singular value: %.1f%%", 100 * share_first)
+
+```
+
+The plot shows a pronounced drop from $\sigma_1$ to $\sigma_2$ and near-zero values from $\sigma_5$ onwards: an effectively rank-four structure. Under strict parallel trends the counterfactual matrix would have rank at most two (unit plus time fixed effects); four non-negligible singular values exceed that signature and motivate an estimator accommodating interactive factor structure (see the discussion of Figure 1 in the paper).
+
+In order to give a concrete interpretation to the low-rank structure recovered, one could look into the correlation between covariates and L.
+
+
+
+
+```{r factor}
+# Inspect correlation between singular values and covariates
+# This allows to interpret the nature of the retrieved low-rank structure
+
+# Varimax rotation to univocally identify factors
+
+
+K=4		# Set a number of factors according to the scree plot
+
+Gamma_hat <- sv$u[, 1:K, drop = FALSE] %*% diag(sqrt(s[1:K]), K)    # extract unit-specific factor loadings
+colnames(Gamma_hat) <- paste0("gamma_", 1:K)
+
+cov_vars <- c("pop_covs", "white_covs", "pov_covs", "medinc_covs")
+
+unit_covs <- df %>%
+  group_by(countyreal) %>%
+  summarise(across(all_of(cov_vars), \(x) mean(x, na.rm = TRUE)),
+            .groups = "drop") %>%
+  arrange(match(countyreal, unit_order))
+
+print(round(cor(Gamma_hat, unit_covs[cov_vars],
+                use = "pairwise.complete.obs"), 3))
+
+```
+
+
+# Unconditional case
+
+## MCP estimation (no covariates)
+
+The MCP fit is common to both control-group comparisons: the estimator uses all untreated cells regardless of how the DiD benchmark defines its controls. `msk_err` is the gap between fitted and observed outcome, kept on treated cells only: minus `msk_err` is the individual treatment effect.
+
+The estimation needs three building blocks, defined once and reused in the conditional case: the aggregation of individual effects into ATTs, the bootstrap summary, and the MCP fit with its bootstrap.
+
+### From imputation errors to ATTs
+
+Cohort-year ATTs from the treated-cell errors, with the same aggregations as the paper: cohort-specific effects (mean over post-treatment years within cohort) and event-study effects (mean over cohorts at each event time). These functions return point estimates only; their uncertainty comes from re-running them on every bootstrap sample.
+
+```{r att-helpers}
+
+# Compute cohort-year ATT table from the matrix of imputation errors
+## Recall that MCP estimates the counterfactual quantities by imputing the "holes" in Y_obs
+## Then the difference between imputed and observed cells gives the treatment effect
+
+compute_att_table <- function(effect_mat, years, first_treat) {
+  # Call relevant information from the effect mat
+  N <- nrow(effect_mat); T <- ncol(effect_mat)
+
+  tibble::tibble(
+    unit        = rep(seq_len(N), each = T),
+    year        = rep(years, N),
+    first_treat = rep(first_treat, each = T),
+    effect      = as.vector(t(effect_mat))
+  ) |>
+    filter(first_treat > 0, year >= first_treat) |>     # retain only treated units in post-treatment years
+    group_by(first_treat, year) |>
+    summarise(att = mean(effect, na.rm = TRUE),
+              n   = dplyr::n(),     # gets the number of units in each group-time
+              .groups = "drop") |>
+    mutate(event_time = year - first_treat) # define event time
+}
+
+# Aggregate treatment effects
+# By cohort
+aggregate_group <- function(att_df) {
+  att_df |>
+    group_by(first_treat) |>
+    summarise(att1 = mean(att, na.rm = TRUE),
+              n    = max(n),
+              .groups = "drop")
+}
+
+# By event-time
+aggregate_event <- function(att_df) {
+  att_df |>
+    group_by(event_time) |>
+    summarise(att1 = mean(att, na.rm = TRUE),
+              n    = sum(n),
+              .groups = "drop")
+}
+```
+
+### Bootstrap summary
+
+From the bootstrap draws of an estimate, compute its standard error (standard deviation of the draws) and its 95% percentile interval, and attach them to the full-sample point estimate.
+
+```{r boot-ci-helper}
+boot_ci <- function(draws, point, keys, point_col, alpha = ALPHA) {
+  summ <- draws |>
+    group_by(across(all_of(keys))) |>   # one row per cell / cohort / event time
+    summarise(boot_se = sd(est),
+              ci_lo   = quantile(est, alpha / 2),
+              ci_hi   = quantile(est, 1 - alpha / 2),
+              .groups = "drop")
+  point |>
+    select(all_of(keys), att = all_of(point_col)) |>   # full-sample (b = 0) ATT
+    left_join(summ, by = keys) |>
+    mutate(sig = !(ci_lo <= 0 & ci_hi >= 0))            # 95% CI excludes zero
+}
+```
+
+### MCP with state-cluster bootstrap
+
+One function does both point estimation and inference:
+
+- **b = 0**: full sample, $\lambda$ selected by cross-validation $\rightarrow$ point estimates.
+- **b = 1, ..., B**: treated counties fixed; never-treated **states** resampled with replacement; MCP refitted at the b = 0 $\lambda$ $\rightarrow$ bootstrap draws.
+
+Resampling whole states keeps within-state correlation intact. Intervals are conditional on the full-sample tuning, since $\lambda$ is not re-selected in each draw.
+
+All $B$ resamples are drawn from the seed before any refit, and the refits then run in parallel (`parallel::mclapply`, `N_CORES` workers). Results are therefore identical for any number of cores. A conditional refit takes a few minutes, so MCP-C dominates the runtime. `mclapply` forks, which is not available on Windows, where it falls back to one core.
+
+```{r run-mcp-helper}
+
+# Define helper to run MCP with the state-cluster bootstrap (X and Z set to NULL for the unconditional case)
+run_mcp <- function(mats, X = NULL, Z = NULL, B = 200, seed = SEED, cores = N_CORES) {
+  set.seed(seed)
+  T <- ncol(mats$Y)
+
+  treated_rows <- which(mats$first_treat > 0)
+  nt           <- which(mats$first_treat == 0)
+  nt_rows      <- split(nt, mats$state[nt])   # never-treated rows, by state
+  S            <- length(nt_rows)
+
+  # Fit MCP on rows idx: lambda by CV if lam = NULL, otherwise refit at lam
+  fit_rows <- function(idx, lam = NULL) {
+    Y_b    <- mats$Y[idx, , drop = FALSE]
+    mask_b <- mats$mask[idx, , drop = FALSE]   # 1 = observed, i.e. 1 - treat_mat
+    X_b    <- if (!is.null(X)) X[idx, , drop = FALSE]
+
+    ## The cross-validation over the lambda grid happens inside mcnnm_cv / mcnnm_wc_cv
+    fit <- if (is.null(lam)) {
+      if (is.null(X)) {
+        mcnnm_cv(Y_b * mask_b, mask_b, to_estimate_u = 1L, to_estimate_v = 1L)   # unconditional
+      } else {
+        mcnnm_wc_cv(Y_b * mask_b, X_b, Z, mask_b,   # conditional
+                    to_estimate_u = 1L, to_estimate_v = 1L,
+                    num_lam_L = 10L, num_lam_H = 10L,
+                    niter = 50L, rel_tol = 1e-5,
+                    cv_ratio = 0.8, num_folds = 1L, is_quiet = 1L)
+      }
+    } else {
+      if (is.null(X)) {
+        mcnnm_fit(Y_b * mask_b, mask_b,   # unconditional
+                  lambda_L = lam[["best_lambda"]],
+                  to_estimate_u = 1L, to_estimate_v = 1L, is_quiet = 1L)
+      } else {
+        mcnnm_wc_fit(Y_b * mask_b, X_b, Z, mask_b,   # conditional
+                     lambda_L = lam[["best_lambda_L"]],
+                     lambda_H = lam[["best_lambda_H"]],
+                     to_estimate_u = 1L, to_estimate_v = 1L,
+                     niter = 50L, rel_tol = 1e-5, is_quiet = 1L)
+      }
+    }
+
+    ## The next lines fill the result objects with the fitted matrix completion model
+    fit$Mhat    <- fit$L + replicate(T, fit$u) + t(replicate(length(idx), fit$v))
+    if (!is.null(X)) {   # conditional: add the covariate term [X, I_N] H [Z, I_T]'
+      fit$Mhat <- fit$Mhat + cbind(X_b, diag(length(idx))) %*% fit$H %*% t(cbind(Z, diag(T)))
+    }
+    fit$msk_err <- (fit$Mhat - Y_b) * (1 - mask_b)   # treated cells only
+    fit$att     <- compute_att_table(-fit$msk_err, mats$years, mats$first_treat[idx])
+    fit
+  }
+
+  # b = 0: full sample, lambda by CV -> point estimates
+  fit0 <- fit_rows(seq_len(nrow(mats$Y)))
+  att0 <- fit0$att
+  lam  <- unlist(fit0[grep("lam", names(fit0), ignore.case = TRUE)])
+
+  # b = 1..B: all resamples drawn first, so results do not depend on `cores`
+  idx_list <- replicate(B, simplify = FALSE,
+    c(treated_rows, unlist(nt_rows[sample.int(S, S, replace = TRUE)], use.names = FALSE)))
+
+  draws <- parallel::mclapply(idx_list, \(idx) {
+    att <- fit_rows(idx, lam)$att
+    list(gt    = att |> select(first_treat, year, est = att),
+         group = aggregate_group(att) |> select(first_treat, est = att1),
+         event = aggregate_event(att) |> select(event_time,  est = att1))
+  }, mc.cores = cores)
+
+  failed <- vapply(draws, inherits, logical(1), "try-error")
+  if (any(failed)) stop(sum(failed), " bootstrap refits failed: ", draws[[which(failed)[1]]])
+
+  boot <- lapply(c(gt = "gt", group = "group", event = "event"),
+                 \(k) bind_rows(lapply(draws, `[[`, k), .id = "b"))
+
+  # Store point estimates, tuning, and bootstrap draws and intervals
+  list(
+    fit       = fit0,
+    att       = att0,
+    lambdas   = lam,
+    rmse      = sqrt(sum(fit0$msk_err^2) / sum(1 - mats$mask)),   # treated cells, as in replication.Rmd
+    B         = B,
+    n_states  = S,
+    boot      = boot,
+    ci = list(
+      gt    = boot_ci(boot$gt,    att0,                  c("first_treat", "year"), "att"),
+      group = boot_ci(boot$group, aggregate_group(att0), "first_treat",            "att1"),
+      event = boot_ci(boot$event, aggregate_event(att0), "event_time",             "att1")
+    )
+  )
+}
+```
+
+### Estimation
+
+```{r mcp-uncond}
+
+# Save results and print performance metrics
+res_u <- run_mcp(mats, B = B)
+sprintf("MCP-U | RMSE = %.4f | B = %d | never-treated states resampled = %d",
+        res_u$rmse, res_u$B, res_u$n_states)
+
+# Tuning: regularization parameter(s) selected by cross-validation
+res_u$lambdas[grep("^best", names(res_u$lambdas))]
+```
+
+## ATT aggregation
+
+Cohort-year ATTs with state-cluster bootstrap standard errors and 95% percentile intervals. `sig` flags cells whose interval excludes zero.
+
+```{r att-uncond}
+
+# Cohort-year ATT table for the unconditional fit
+knitr::kable(res_u$ci$gt |>
+               mutate(event_time = year - first_treat) |>
+               select(first_treat, year, event_time, att, boot_se,
+                      ci_lo, ci_hi, sig),
+             digits = 4,
+             caption = "MCP-U: cohort-year ATT, bootstrap s.e. and 95% CIs")
+```
+
+## Group-time plot (MCP)
+
+The plot replicates the format of the left panels of Figures A.1--A.4 in the paper: one facet per treatment cohort, pre-treatment estimates in red, post-treatment in steelblue, common $y$ scale $[-0.2, 0.1]$. Pre-treatment "effects" come from `msk_err` and are zero by construction in the MCP framework, so they carry no interval; post-treatment error bars are the bootstrap 95% percentile intervals. As in the paper, all panels start in 2002 (the DiD benchmark loses 2001 mechanically, since its group-time estimates are defined in first differences against a base period).
+
+```{r mcp-plot-helper}
+
+# Recreate group-time table including pre-treatment years, from msk_err,
+# and attach the bootstrap intervals to the post-treatment cells
+build_att_pre_post <- function(res, mats) {
+  N <- nrow(res$fit$msk_err); T <- ncol(res$fit$msk_err)
+
+  tibble::tibble(
+    unit        = rep(seq_len(N), each = T),
+    year        = rep(mats$years, N),
+    first_treat = rep(mats$first_treat, each = T),
+    effect      = as.vector(t(-res$fit$msk_err))
+  ) |>
+    filter(first_treat > 0) |>
+    group_by(first_treat, year) |>
+    summarise(att = mean(effect, na.rm = TRUE),
+              .groups = "drop") |>
+    left_join(res$ci$gt |> select(first_treat, year, ci_lo, ci_hi),
+              by = c("first_treat", "year")) |>
+    mutate(
+      lower_bound = coalesce(ci_lo, att),   # pre-treatment: no interval
+      upper_bound = coalesce(ci_hi, att),
+      Group = paste("Group", first_treat),
+      color = ifelse(year < first_treat, "Pre", "Post")
+    )
+}
+
+# Formatting for the left panels of Figures A.1-A.4
+plot_mcp_group <- function(att_pp) {
+  att_pp <- att_pp |> filter(year > 2001)   # align with the DiD panels, which start in 2002
+  ggplot(att_pp, aes(x = as.numeric(year), y = att, color = color)) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_point(size = 2) +
+    geom_errorbar(aes(ymin = lower_bound, ymax = upper_bound), width = 0.2) +
+    facet_wrap(~ Group, ncol = 1, scales = "free_x") +
+    scale_x_continuous(breaks = unique(as.numeric(att_pp$year))) +
+    scale_y_continuous(limits = c(-0.2, 0.1)) +
+    labs(x = "", y = "", color = "") +
+    scale_color_manual(values = c("Pre" = "red", "Post" = "steelblue")) +
+    theme_classic() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+      strip.text = element_text(size = 12, face = "bold",
+                                color = "gray50", hjust = 0),
+      strip.background = element_blank(),
+      axis.text = element_text(size = 10),
+      panel.grid = element_blank(),
+      axis.line.x = element_line(color = "black"),
+      legend.position = "bottom"
+    )
+}
+```
+
+```{r plot-uncond-mcp, fig.cap="Minimum wage group-time average treatment effects, MCP, unconditional case, bootstrap 95% CIs (left panels of paper Figures A.2 and A.4)."}
+att_pp_u <- build_att_pre_post(res_u, mats)
+plot_mcp_group(att_pp_u)
+```
+
+## Comparison with staggered DiD {.tabset}
+
+CS estimated without covariates (`xformla = ~ 1`), for each control group. The MCP column is identical across tabs; only the DiD benchmark changes. MCP standard errors are from the state-cluster bootstrap, DiD standard errors from the `did` multiplier bootstrap, also clustered by state (`clustervars = "state_name"`).
+
+```{r did-helpers}
+
+# This chunk calls the function att_gt from Callaway and Sant'Anna's `did` package
+run_cs <- function(df, control_group, xformla = ~ 1) {
+  set.seed(SEED)   # did bootstrap s.e. do not depend on what ran before
+  out <- att_gt(
+    yname         = "lemp",
+    gname         = "firsttreat",
+    idname        = "countyreal",
+    tname         = "year",
+    xformla       = xformla,
+    data          = df,
+    est_method    = "reg",
+    control_group = control_group,
+    clustervars   = "state_name"   # cluster by state, as in the MCP bootstrap
+  )
+  list(gt    = out,
+       group = aggte(out, type = "group"),
+       dyn   = aggte(out, type = "dynamic"))
+}
+
+# Side-by-side MCP vs CS table
+## This is the layout for Tables 2, A.3-A.5
+comparison_table <- function(res, cs, caption) {
+  grp <- res$ci$group |>
+    transmute(label = paste0("g = ", first_treat),
+              mcp_att = att, mcp_se = boot_se)
+  evt <- res$ci$event |>
+    transmute(label = paste0("e = ", event_time),
+              mcp_att = att, mcp_se = boot_se)
+
+  cs_grp <- tibble::tibble(label  = paste0("g = ", cs$group$egt),
+                           cs_att = cs$group$att.egt,
+                           cs_se  = cs$group$se.egt)
+  cs_evt <- tibble::tibble(label  = paste0("e = ", cs$dyn$egt),
+                           cs_att = cs$dyn$att.egt,
+                           cs_se  = cs$dyn$se.egt)
+
+  bind_rows(
+    left_join(grp, cs_grp, by = "label"),
+    left_join(evt, cs_evt, by = "label")
+  ) |>
+    knitr::kable(digits = 4, caption = caption,
+                 col.names = c("", "MCP ATT", "MCP s.e. (bootstrap)",
+                               "DiD ATT", "DiD s.e."))
+}
+```
+
+### Not-yet-treated (benchmark)
+
+```{r cs-uncond-nyt}
+
+# Set control_group to "notyettreated"
+cs_u_nyt <- run_cs(df, control_group = "notyettreated")
+comparison_table(res_u, cs_u_nyt,
+  "Cohort-specific effects and event study, unconditional case. Control group: not-yet-treated (paper Table A.4)")
+```
+
+```{r plot-uncond-nyt, fig.cap="Minimum wage group-time average treatment effects --- unconditional parallel trends. Control group: not-yet-treated (paper Figure A.2). Left: MCP; right: CS."}
+plot_mcp_group(att_pp_u)
+ggdid(cs_u_nyt$gt, ylim = c(-.25, .1))
+```
+
+### Never-treated
+
+```{r cs-uncond-nt}
+# Set control_group to "nevertreated"
+cs_u_nt <- run_cs(df, control_group = "nevertreated")
+comparison_table(res_u, cs_u_nt,
+  "Cohort-specific effects and event study, unconditional case. Control group: never-treated (paper Table A.5)")
+```
+
+```{r plot-uncond-nt, fig.cap="Minimum wage group-time average treatment effects --- unconditional parallel trends. Control group: never-treated (paper Figure A.4). Left: MCP; right: CS."}
+plot_mcp_group(att_pp_u)
+ggdid(cs_u_nt$gt, ylim = c(-.25, .1))
+```
+
+# Conditional case (with covariates)
+
+## MCP estimation with covariates
+
+As in the original conditional script, the MCP estimation sample starts in 2002 and rows with missing covariates are dropped; covariates enter `mcnnm_wc_cv` as unit means ($X$) and time means ($Z$), the only structure supported by the package (see the software note in Section 2.1 of the paper). The fitted counterfactual includes the covariate term, $\hat M = \hat L + [X, I_N]\,\hat H\,[Z, I_T]' + \hat u\,\mathbf 1' + \mathbf 1\,\hat v'$: `mcnnm_wc` appends identity matrices to $X$ and $Z$, so $H$ also carries time-specific coefficients on the unit covariates and unit-specific coefficients on the time covariates. The same `run_mcp` is used, now with $X$ and $Z$: cross-validation and bootstrap refits are over both $\lambda_L$ and $\lambda_H$.
+
+```{r mcp-cond}
+
+# CS benchmark sample: full panel, rows with missing covariates dropped
+df_c <- df |>
+  drop_na(all_of(cov_vars))
+
+mats_c <- build_panel_matrices(df_c, cov_names = cov_vars)
+
+res_c <- run_mcp(mats_c, X = mats_c$X, Z = mats_c$Z, B = B)
+sprintf("MCP-C | RMSE = %.4f | B = %d | never-treated states resampled = %d",
+        res_c$rmse, res_c$B, res_c$n_states)
+
+# Extra step of tuning: two regularization parameters (lambda_L and lambda_H) to select by CV
+res_c$lambdas[grep("^best", names(res_c$lambdas))]
+```
+
+## ATT aggregation
+
+```{r att-cond}
+knitr::kable(res_c$ci$gt |>
+               mutate(event_time = year - first_treat) |>
+               select(first_treat, year, event_time, att, boot_se,
+                      ci_lo, ci_hi, sig),
+             digits = 4,
+             caption = "MCP-C: cohort-year ATT, bootstrap s.e. and 95% CIs")
+```
+
+## Group-time plot (MCP)
+
+```{r plot-cond-mcp, fig.cap="Minimum wage group-time average treatment effects, MCP, conditional case, bootstrap 95% CIs (left panels of paper Figures A.1 and A.3)."}
+att_pp_c <- build_att_pre_post(res_c, mats_c)
+plot_mcp_group(att_pp_c)
+```
+
+## Comparison with staggered DiD {.tabset}
+
+CS estimated with the reconstructed time-varying covariates, on the full panel.
+
+### Not-yet-treated (benchmark)
+
+```{r cs-cond-nyt}
+cs_c_nyt <- run_cs(df_c,
+                   control_group = "notyettreated",
+                   xformla = ~ white_covs + pop_covs + pov_covs + medinc_covs)
+comparison_table(res_c, cs_c_nyt,
+  "Cohort-specific effects and event study, conditional case. Control group: not-yet-treated (paper Table 2)")
+```
+
+```{r plot-cond-nyt, fig.cap="Minimum wage group-time average treatment effects --- conditional parallel trends. Control group: not-yet-treated (paper Figure A.1). Left: MCP; right: CS."}
+plot_mcp_group(att_pp_c)
+ggdid(cs_c_nyt$gt, ylim = c(-.25, .1))
+```
+
+### Never-treated
+
+```{r cs-cond-nt}
+cs_c_nt <- run_cs(df_c,
+                  control_group = "nevertreated",
+                  xformla = ~ white_covs + pop_covs + pov_covs + medinc_covs)
+comparison_table(res_c, cs_c_nt,
+  "Cohort-specific effects and event study, conditional case. Control group: never-treated (paper Table A.3)")
+```
+
+```{r plot-cond-nt, fig.cap="Minimum wage group-time average treatment effects --- conditional parallel trends. Control group: never-treated (paper Figure A.3). Left: MCP; right: CS."}
+plot_mcp_group(att_pp_c)
+ggdid(cs_c_nt$gt, ylim = c(-.25, .1))
+```
+
+# Implementation details
+
+This section reports the tuning, convergence and bootstrap settings. Everything below is computed from the fitted objects at knit time.
+
+**Software.** MCP is estimated with the `MCPanel` package (version reported below and in the session info). Unit and time fixed effects are estimated without regularization (`to_estimate_u = to_estimate_v = 1`), consistent with eq. (3) of the paper.
+
+**Candidate grid.** The grid is built internally by `mcnnm_lam_range` / `mcnnm_wc_lam_range`: values spaced geometrically from $\lambda_{\max}$ (the smallest value shrinking $L$ to zero) down to $10^{-3}\lambda_{\max}$. Unconditional: package default of 100 values for $\lambda_L$, 5-fold CV, `niter = 400`, `rel_tol = 1e-5`. Conditional: $10 \times 10$ grid for $(\lambda_L, \lambda_H)$, single fold, `niter = 50`, `rel_tol = 1e-5` --- coarser settings dictated by the computational cost of the joint search. In both cases each fold trains on a random 80% of the observed (untreated) cells and validates on the remaining 20%; the final model is refitted on all observed cells at the selected $\lambda$.
+
+Note that, in our applications, the best lambda is identified at the first CV round and stays the same across folds.
+
+**Bootstrap.** $B$ state-cluster resamples of the never-treated states, with treated counties held fixed in every draw. Each draw is refitted at the full-sample $\lambda$ (`mcnnm_fit` / `mcnnm_wc_fit`), so the intervals are conditional on the full-sample tuning and capture sampling uncertainty on the control side only. Standard errors are the standard deviation of the draws; intervals are the $\alpha/2$ and $1-\alpha/2$ percentiles.
+
+```{r implementation-details}
+tibble::tibble(
+  component = c("R", "MCPanel", "did", "seed", "bootstrap B"),
+  value     = c(paste(R.version$major, R.version$minor, sep = "."),
+                as.character(utils::packageVersion("MCPanel")),
+                as.character(utils::packageVersion("did")),
+                as.character(SEED), as.character(B))
+) |>
+  knitr::kable(caption = "Software versions and settings")
+
+# Regularization parameters selected by CV on the full sample, reused in every bootstrap refit
+best_lam <- function(lams) lams[grep("^best", names(lams))]
+bind_rows(
+  tibble::tibble(fit = "MCP-U", parameter = names(best_lam(res_u$lambdas)),
+                 value = unname(best_lam(res_u$lambdas))),
+  tibble::tibble(fit = "MCP-C", parameter = names(best_lam(res_c$lambdas)),
+                 value = unname(best_lam(res_c$lambdas)))
+) |>
+  knitr::kable(digits = 8,
+               caption = "Regularization parameters selected by CV (full sample)")
+
+# Bootstrap diagnostics: every cell should have B draws
+boot_diag <- function(res, label) {
+  tibble::tibble(
+    fit              = label,
+    B                = res$B,
+    resampled_states = res$n_states,
+    min_draws_cell   = min(count(res$boot$gt, first_treat, year)$n),
+    mean_boot_se_gt  = mean(res$ci$gt$boot_se)
+  )
+}
+bind_rows(boot_diag(res_u, "MCP-U"), boot_diag(res_c, "MCP-C")) |>
+  knitr::kable(digits = 4, caption = "Bootstrap diagnostics")
+
+# Effective rank of L_hat implied by the selected penalty
+eff_rank <- function(L) sum(svd(L)$d > max(svd(L)$d) * 1e-8)
+tibble::tibble(fit = c("MCP-U", "MCP-C"),
+               effective_rank = c(eff_rank(res_u$fit$L), eff_rank(res_c$fit$L))) |>
+  knitr::kable(caption = "Effective rank of the estimated low-rank component")
+```
+
+# Falsification: parallel trends via MCP
+
+Following Section 4.1 and Appendix A.4.1 of the paper. We take $\hat Y_{it}(0)$ from the MCP estimate --- which coincides with the observed outcome wherever $W_{it}=0$ --- compute its first difference $dY_{it}(0)$, and regress it on a cohort dummy $G_g$ over the window $t \ge \tau_g$:
+
+- **Never-treated test (eq. 6)**: $G_g = 1$ for units first treated in $g$, $0$ for never-treated units; other cohorts excluded.
+- **Not-yet-treated test (eq. 7)**: $G_g = 1$ for units first treated in $g$, $0$ for never-treated units and cohorts treated after $g$. For the last cohort (2007) the not-yet-treated group coincides with the never-treated, so the cell is empty as in Table 3.
+
+The conditional version (Table 3) includes the covariates in the regression; the unconditional version (Table A.6) does not. The test uses the full-sample MCP fit (b = 0).
+
+```{r pt-falsification-helper}
+pt_falsification <- function(fit, mats, df_long = NULL, cov_names = NULL) {
+
+  # Imputed untreated-outcome matrix: observed where W=0, imputed where W=1
+  Y0  <- mats$Y * mats$mask + fit$Mhat * (1 - mats$mask)
+  dY0 <- Y0[, -1, drop = FALSE] - Y0[, -ncol(Y0), drop = FALSE]
+  colnames(dY0) <- mats$years[-1]
+
+  long <- tibble::tibble(
+    countyreal  = rep(mats$unit_order, each = ncol(dY0)),
+    year        = rep(as.integer(colnames(dY0)), nrow(dY0)),
+    first_treat = rep(mats$first_treat, each = ncol(dY0)),
+    dy          = as.vector(t(dY0))
+  )
+
+  if (!is.null(cov_names)) {
+    long <- long |>
+      left_join(df_long |> select(countyreal, year, all_of(cov_names)),
+                by = c("countyreal", "year"))
+  }
+
+  cohorts <- sort(unique(long$first_treat[long$first_treat > 0]))
+
+  run_one <- function(g, control) {
+    keep <- if (control == "never") {
+      long$first_treat %in% c(0, g)
+    } else {
+      long$first_treat == g | long$first_treat == 0 | long$first_treat > g
+    }
+    # NYT is degenerate (== never-treated) for the last cohort
+    if (control == "nyt" && !any(long$first_treat > g)) return(NULL)
+
+    dat <- long[keep & long$year >= g, , drop = FALSE] |>
+      mutate(G = as.integer(first_treat == g)) |>
+      drop_na()
+
+    f <- if (is.null(cov_names)) dy ~ G else reformulate(c("G", cov_names), "dy")
+    co <- summary(lm(f, data = dat))$coefficients["G", ]
+
+    tibble::tibble(cohort = g, control = control,
+                   coef = co[["Estimate"]], se = co[["Std. Error"]])
+  }
+
+  bind_rows(lapply(cohorts, \(g)
+    bind_rows(run_one(g, "never"), run_one(g, "nyt")))) |>
+    mutate(cell = sprintf("%.3f (%.3f)", coef, se)) |>
+    select(cohort, control, cell) |>
+    pivot_wider(names_from = control, values_from = cell) |>
+    rename(`Never-treated` = never, `Not-yet-treated` = nyt)
+}
+```
+
+```{r pt-falsification-tables}
+pt_falsification(res_c$fit, mats_c, df_c, cov_names = cov_vars) |>
+  knitr::kable(caption = "Testing the parallel trends assumption, conditional case (paper Table 3). Coefficient (s.e.).")
+
+pt_falsification(res_u$fit, mats) |>
+  knitr::kable(caption = "Testing the parallel trends assumption, unconditional case (paper Table A.6). Coefficient (s.e.).")
+```
+
+# Session info
+
+```{r sessioninfo, cache=FALSE}
+sessionInfo()
+```
